@@ -1,20 +1,19 @@
 /*****************************************************************
- *  This software is used to regulate the bolus heat/cooling system
+ *  This software is used to control the bolus heat/cooling system
  *  It consist of following hardware:
  *  1 pcs Arduino UNO
  *  1 pcs LCD Display 2 x 16 characters type "JHED162A or simular"
- *    using paralell interface
  *  1 pcs I2C to paralell converter
  *  2 pcs Digaital servo 25Kg metal gear, 4.8 - 6.8 V 
- *  1 pcs Flow rate sensor type "YF-S201"
  *  2 pcs temp sensors type Dallas DS18B20
  *  1 pcs switch
+ *  1 pcs of 5V relay
  *  1 pcs Power supply 12V 3A
- *  1 pcs DC/DC (12 -> 6.8V)
+ *  1 pcs DC/DC (12 -> 6.8V) used by servos
  * 
  ***************************************************************/
 
-#define VERSION "2023-04-20"
+#define VERSION "2023-04-11"
 
 #include <Arduino.h>
 
@@ -46,8 +45,8 @@ void AdjustTemperature(int);
 // Valve parameters
 #define COLD_VALVE 0
 #define HOT_VALVE 1
-#define CLOSE_COLD_VALVE 105    
-#define CLOSE_HOT_VALVE 105    // PWM values -> Closed 105 Max open 5
+#define CLOSE_COLD_VALVE 0      //105    
+#define CLOSE_HOT_VALVE  0      //105 PWM values -> Closed 0 Max open 105
 
 // Servo connections PWM pins
 #define HOT_PIN  9        
@@ -60,6 +59,7 @@ Servo ColdServo;
 #define ONE_WIRE_BUS 2                        // Data wire is plugged into digital pin 2 on the Arduino using 4k7 pullup
 #define TEMP_PRIMARY  0
 #define TEMP_SECONDARY 1
+
 // Calibration of sensors
 #define TEMP_PRIMARY_RAW_HIGH 98.3            // Here is the calibration messurement boiling water
 #define TEMP_PRIMARY_RAW_LOW 0.06             // Here is the calibration messurement ice water
@@ -82,28 +82,33 @@ uint8_t secondary_temp_sensor[] = {0x28, 0xC2, 0x49, 0x7A, 0x20, 0x22, 0x09, 0x1
 OneWire oneWire(ONE_WIRE_BUS);                // Make fysical connection
 DallasTemperature sensors(&oneWire);          // Pass oneWire reference to DallasTemperature library
 
-// Selection switch (Manual/computer temp setting)
-#define SELECTION_SWITCH_PIN 3
-bool ManMode = false;                         // Defalt Computer communication
+#define SELECTION_SWITCH_PIN 3                // Selection switch (Manual/computer temp setting)
+bool ManMode;                                 
+#define MAN_MODE true;                        // Manual mode
+#define COMP_MODE false;                      // Computer mode
 
-// Potentiometer manual mode
-#define POT_PIN A0
+#define POT_PIN A0                            // Potentiometer manual mode
 
 // Setup LCD, I2C address 0x27, 16 column and 2 rows
 #define I2C_ADDRESS  0x27                     // I2C to parallel address
 #define ROWS 2                                // 2 rows display
 #define COLUMN 16                             // 16 character
 LiquidCrystal_I2C lcd(I2C_ADDRESS, COLUMN, ROWS); // Setup display
-String  Mystring = "";                        // Used in LCD display
+String  Mystring = "";                        // Temporary string used to handle the LCD display
 
-
-bool StartUp = true;
+// Flags
 bool ManModeFlag = false;
+bool PowerOffFlag = false;
+bool ManZeroFlag = false;
+bool CompZeroFlag = false;
+bool PreviousMode;
 
-bool PowerOff = false;
-unsigned long timer;
+unsigned long timer;                          // Used to calculate the Pushbutton time
 int SetTemperature, temp = NONE;
-int OldCommand = ZERO;
+int OldCommand = ZERO;                        // The last command from computer
+int PotValue;
+int OldManSetTemperature = ZERO;
+int OldCompSetTemperature = ZERO;
 
 void setup() {
 
@@ -112,22 +117,18 @@ void setup() {
   pinMode(POWER_SWITCH, INPUT_PULLUP);
   pinMode(POWER_RELAY, OUTPUT);
 
+  // Power On
   digitalWrite(POWER_RELAY, HIGH);
 
   // Servo pins
   HotServo.attach(HOT_PIN);    
   ColdServo.attach(COLD_PIN);
-   
-  
+    
   // Setup serial port
   Serial.begin(SERIAL_SPEED);
 
-  // Init Dallas library
+  // Init Dallas sensor library (temp sensors)
   sensors.begin();	
-  
-
-
-
   
   // Initialize the LCD
   lcd.init();                   
@@ -136,23 +137,25 @@ void setup() {
   lcd.setCursor(0, 0);         // move cursor to   (0, 0)
   lcd.print("Starting.....");  // Staring text
 
-    // No input water yet 
+  // No water input yet,close valves 
   SetBallValve(COLD_VALVE, CLOSE_COLD_VALVE);
   SetBallValve(HOT_VALVE, CLOSE_HOT_VALVE);
-  delay(3000);                  // Wait for valves to close
+  delay(3000);                  // Wait for valves to close                
 
-  if(digitalRead(SELECTION_SWITCH_PIN)){
+  if(digitalRead(SELECTION_SWITCH_PIN)){  // Manual mode?
+    PreviousMode = MAN_MODE;
     Mystring = "SetV (--)";
     Mystring.concat("  MAN");
-  }else{
+  }else{                                  // Computer mode
+  PreviousMode = COMP_MODE;
     Mystring = "SetV (--)";
     Mystring.concat("   COMP ");
   }
-  lcd.setCursor(0, 0);
+  lcd.setCursor(0, 0);                    // Setup screen
   lcd.print(Mystring); 
   Mystring = "Bolus "; 
   Mystring.concat(Trim_temperature(GetTemp(TEMP_SECONDARY)));
-  Mystring.remove(10,1);
+  Mystring.remove(10,1);                  // Skip hundredths decimal place
   lcd.setCursor(0, 1);
   lcd.print(Mystring); 
 
@@ -160,65 +163,54 @@ void setup() {
 }     
 
 void loop() {
-  //************************* OBS!!!!!!!!!
-
-  
-
 
   delay(100);
 
 
-  if(!digitalRead(POWER_SWITCH)){
-    if(PowerOff == false){
-      PowerOff = true;
-      timer = millis(); 
-    }else{
-      if(millis() - timer > 2000){
-        lcd.clear();
-        lcd.setCursor(0, 0);
-        lcd.print("Power Off ....."); 
-        delay(4000);
-        digitalWrite(POWER_RELAY, LOW); // Power off
-      }
-    }
-  }
+
 
   ManMode = (bool)digitalRead(SELECTION_SWITCH_PIN);
-
-  if(ManMode){    // Manuell mode?
-    ManModeFlag = true;
-    if(analogRead(POT_PIN) == ZERO){                // No temp is choosen, close valves
+  if(ManMode){
+     ManModeFlag = true;
+     PotValue = analogRead(POT_PIN); 
+    if(PotValue == ZERO && !ManZeroFlag){                    // No temp is choosen, close valves
       SetBallValve(COLD_VALVE, CLOSE_COLD_VALVE);
       SetBallValve(HOT_VALVE, CLOSE_HOT_VALVE);
+      ManZeroFlag = true;
       Mystring = "SetV (--)";
-      Mystring.concat("  MAN");
+      Mystring.concat("  MAN  ");
       lcd.setCursor(0, 0);
       lcd.print(Mystring); 
-    }else{
-      SetTemperature = map(analogRead(POT_PIN), 0, 1023, 10, 50);   // From pot min to max, map to 10 to 50 degrees  
-      Mystring = "SetV (";
-      Mystring.concat(SetTemperature);
-      Mystring.concat(")  MAN  ");
-      lcd.setCursor(0, 0);
-      lcd.print(Mystring);
-      AdjustTemperature(SetTemperature); 
+    }else if(PotValue > ZERO){                        // Real temp value
+      ManZeroFlag = false;
+      SetTemperature = map(analogRead(POT_PIN), 0, 1023, 10, 50);   // From pot min to max, map to 10 to 50 °C
+      if(OldManSetTemperature != SetTemperature){
+        OldManSetTemperature = SetTemperature;
+        Mystring = "SetV (";
+        Mystring.concat(SetTemperature);
+        Mystring.concat(")  MAN  ");
+        lcd.setCursor(0, 0);
+        lcd.print(Mystring); 
+      }
     }
-    Mystring = "Bolus "; 
-    Mystring.concat(Trim_temperature(GetTemp(TEMP_SECONDARY)));
-    Mystring.remove(10,1);
-    lcd.setCursor(0, 1);
-    lcd.print(Mystring); 
-  }else{          // Check if computer have send a command
+  }else{ // Computer mode
     temp = GetCommand();
-    if(ManModeFlag){ // If manual mode before, go back to old computer value
-      ManModeFlag = false;
-      temp = OldCommand;  
+    if(ManModeFlag){                              // If manual mode before, go back to old computer value
+      ManModeFlag = false;                        // Clean up man mode
+      ManZeroFlag = false;                        // Clean up man mode
+      OldManSetTemperature = ZERO;                // Clean up man mode
+      temp = OldCompSetTemperature;               // Restore old value
+      OldCompSetTemperature = ZERO;               // Enable new uppdate
+      
+      CompZeroFlag = false;                       // Enable new "ZERO value loop" 
     }
-    if(temp != NONE){
-     //Legal command is received
+    
+    if(temp != NONE){                             //Is legal command is received
       SetTemperature = temp; 
-      if(SetTemperature == ZERO){
-        OldCommand = SetTemperature;
+      Serial.println(OldCompSetTemperature);
+      if(SetTemperature == ZERO && !CompZeroFlag){
+        CompZeroFlag = true;
+        OldCompSetTemperature = SetTemperature;
         SetBallValve(COLD_VALVE, CLOSE_COLD_VALVE);  // Close input water
         SetBallValve(HOT_VALVE, CLOSE_HOT_VALVE);
         Mystring = "SetV (--)";
@@ -230,27 +222,48 @@ void loop() {
         Mystring.remove(10,1);
         lcd.setCursor(0, 1);
         lcd.print(Mystring); 
-      }else if(SetTemperature >= MIN_TEMP && SetTemperature <= MAX_TEMP){
-        OldCommand = SetTemperature;
-        //lcd.clear(); 
-        Mystring = "SetV (";
-        Mystring.concat(SetTemperature);
-        Mystring.concat(")   COMP ");
-        lcd.setCursor(0, 0);
-        lcd.print(Mystring);
-        Mystring = "Bolus "; 
-        Mystring.concat(Trim_temperature(GetTemp(TEMP_SECONDARY)));
-        Mystring.remove(10,1);
-        lcd.setCursor(0, 1);
-        lcd.print(Mystring); 
-      Serial.println(SetTemperature);
-        AdjustTemperature(SetTemperature);
-      } 
-    }
 
+      }else if(SetTemperature >= MIN_TEMP && SetTemperature <= MAX_TEMP){ Serial.println(SetTemperature);
+          if(OldCompSetTemperature != SetTemperature){
+          CompZeroFlag = false;                          // Enable new "ZERO value loop"
+          OldCompSetTemperature = SetTemperature;
+          Mystring = "SetV (";
+          Mystring.concat(SetTemperature);
+          Mystring.concat(")   COMP ");
+          lcd.setCursor(0, 0);
+          lcd.print(Mystring);
+          Mystring = "Bolus "; 
+          Mystring.concat(Trim_temperature(GetTemp(TEMP_SECONDARY)));
+          Mystring.remove(10,1);
+          lcd.setCursor(0, 1);
+          lcd.print(Mystring); 
+        }
+         
+      } 
+    } 
   }
 
-  
+  // regulate temperature
+  // Uppdate set value Display
+
+
+
+
+
+  if(!digitalRead(POWER_SWITCH)){   // Switch pressed?
+    if(PowerOffFlag == false){
+      PowerOffFlag = true;
+      timer = millis(); 
+    }else{                  
+      if(millis() - timer > 3000){  // Switch pressed > 3sec, time to power off
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Power Off ....."); 
+        delay(4000);
+        digitalWrite(POWER_RELAY, LOW); // Power off
+      }
+    }
+  }  
 
 }
 
@@ -342,37 +355,28 @@ void SetBallValve(int valve, int value){
 *********************************************************/
 
 int GetCommand(void){
-  int temp;
+  int temp = NONE;
+  String TempString ="";
 
-/*
-
-    if(Serial.available()){
+  if(Serial.available()){
     String buffer = Serial.readString();
     buffer.trim();
     if(buffer.charAt(0) == '#'){
-      buffer.remove(0,1);
-      buffer.remove(2);
-      temp = buffer.toInt();
-      if(temp == ZERO || (temp >= MIN_TEMP && temp <= MAX_TEMP)){
-        return(temp);
-      }
-    }
-*/
-  if(Serial.available()){
-    String buffer = Serial.readString();
-    buffer.trim();Serial.println(buffer);
-    if(buffer.charAt(0) == '#'){
       buffer.remove(0,1); 
-      temp = buffer.toInt();
-      if(temp == ZERO || (temp >= MIN_TEMP && temp <= MAX_TEMP)){
-        return(temp);
+      if(buffer.charAt(0) == '?'){          // Computer waiting for temp value
+        TempString = "#";                   
+        TempString.concat(Trim_temperature(GetTemp(TEMP_SECONDARY)));
+        TempString.remove(5,1);
+        Serial.println(TempString);
+      }else{                                // Computer have sen a message
+        temp = buffer.toInt();
+        if(!(temp == ZERO || (temp >= MIN_TEMP && temp <= MAX_TEMP))){  // Not leagal value?
+          temp = NONE;
+        }
       }
     }
-  }else{
-     return(NONE);
   }
-  
- 
+  return(temp);
 }
 
 
